@@ -42,12 +42,14 @@ import sys
 import docopt
 import hdfs
 import requests
+from requests.packages.urllib3.exceptions import InsecurePlatformWarning
 import re
 
 import Queue
 import threading
 import hashlib
 
+requests.packages.urllib3.disable_warnings(InsecurePlatformWarning)
 logger = logging.getLogger(__name__)
 
 BASE_DUMP_URI_PATTERN = 'http://dumps.wikimedia.org/{0}/{1}'
@@ -71,6 +73,7 @@ class DumpDownloader(object):
                  base_path,
                  user,
                  num_threads,
+                 num_retries,
                  buffer_size,
                  timeout,
                  force):
@@ -80,6 +83,7 @@ class DumpDownloader(object):
         self.base_path = base_path
         self.user = user
         self.num_threads = num_threads
+        self.num_retries = num_retries
         self.buffer_size = buffer_size
         self.timeout = timeout
         self.force = force
@@ -94,7 +98,7 @@ class DumpDownloader(object):
         self._download_dumps()
 
     def _verifty_dump_ready_for_download(self):
-        url = DUMP_STATUS_URI_PATTERN.format(wikidb, day)
+        url = DUMP_STATUS_URI_PATTERN.format(self.wikidb, self.day)
         logger.debug("Checking for dump completion at {0}".format(url))
         req = requests.get(url)
         if not ((req.status_code == 200) and ('Dump complete' in req.text)):
@@ -106,12 +110,12 @@ class DumpDownloader(object):
         self.hdfs_client = hdfs.client.InsecureClient(name_node, user=user)
 
     def _configure_output_path(self):
-        self.output_path = os.path.join(base_path,
+        self.output_path = os.path.join(self.base_path,
                                         '{0}-{1}'.format(self.wikidb, self.day),
                                         'xmlbz2')
 
     def _identify_target_file_list_and_md5s(self):
-        url = DUMP_MD5_URI_PATTERN.format(self.wikidb, self.day),
+        url = DUMP_MD5_URI_PATTERN.format(self.wikidb, self.day)
         bz2_pattern = DUMP_BZ2_FILE_PATTERN.format(self.wikidb, self.day)
         logger.debug("Getting files list to download {0}".format(url))
         req = requests.get(url)
@@ -130,22 +134,29 @@ class DumpDownloader(object):
 
     def _check_status_of_existing_files(self):
         self.statuses = {}
-        present_files = self.hdfs_client.list(self.output_path)
+        present_files = []
+        if self.hdfs_client.content(self.output_path, strict=False):
+            present_files = self.hdfs_client.list(self.output_path)
         for filename in self.filenames:
-            fullpath = os.path.join(output_path, filename)
-            if f_name not in present_files:
-                logging.debug("{0} is absent".format(filename))
+            fullpath = os.path.join(self.output_path, filename)
+            if filename not in present_files:
+                logger.debug("{0} is absent".format(filename))
                 self.statuses[filename] = FILE_ABSENT
             elif self._confirm_checksum(filename):
-                logging.debug("{0} is present".format(filename))
+                logger.debug("{0} is present".format(filename))
                 self.statuses[filename] = FILE_PRESENT
             else:
-                logging.debug("{0} is corrupt".format(filename))
+                logger.debug("{0} is corrupt".format(filename))
                 self.statuses[filename] = FILE_CORRUPT
 
     def _confirm_checksum(self, filename):
+        logger.debug("confirming checksum for {0}".format(filename))
         found = self._md5sum_for_file(filename)
         given = self.md5s[filename]
+        if found == given:
+            logger.debug("checksum for {0} correct".format(filename))
+        else:
+            logger.debug("checksum for {0} wrong".format(filename))
         return given == found
 
     def _md5sum_for_file(self, filename):
@@ -156,13 +167,14 @@ class DumpDownloader(object):
                 md5.update(chunk)
         return md5.hexdigest()
 
-    def _prepare_hdfs(self, hdfs_path, files_info, force):
+    def _prepare_hdfs(self):
         if self.hdfs_client.content(self.output_path, strict=False):
             if self.force:
                 try:
                     self.hdfs_client.delete(self.output_path, recursive=True)
                     self.hdfs_client.makedirs(self.output_path)
-                    [self.statuses[f] = FILE_ABSENT for f in self.statuses]
+                    for f in self.statuses:
+                        self.statuses[f] = FILE_ABSENT
                 except hdfs.HdfsError as e:
                     logger.error(e)
                     raise RuntimeError("Problem preparing for download [force].")
@@ -183,18 +195,18 @@ class DumpDownloader(object):
     def _remove_corrupt_and_unexpected_files(self):
         present_files = self.hdfs_client.list(self.output_path)
         for filename in present_files:
-            file_path = os.path.join(hdfs_path, filename)
+            file_path = os.path.join(self.output_path, filename)
             if (filename not in self.filenames):
-                logging.debug("Deleting {0} because it doesn't belong".format(
+                logger.debug("Deleting {0} because it doesn't belong".format(
                               filename))
-                hdfs_client.delete(file_path, recursive=True)
+                self.hdfs_client.delete(file_path, recursive=True)
             if (self.statuses[filename] == FILE_CORRUPT):
-                logging.debug("Deleting {0} because it is is corrupt".format(
+                logger.debug("Deleting {0} because it is is corrupt".format(
                               filename))
-                hdfs_client.delete(file_path, recursive=True)
+                self.hdfs_client.delete(file_path, recursive=True)
                 self.statuses[filename] = FILE_ABSENT
 
-    def _download_dumps():
+    def _download_dumps(self):
         logger.debug("Instantiating {0} workers ".format(self.num_threads) +
                      "to download {0} files.".format(len(self.filenames)))
 
