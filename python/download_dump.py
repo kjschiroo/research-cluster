@@ -153,10 +153,6 @@ class DumpDownloader(object):
         logger.debug("confirming checksum for {0}".format(filename))
         found = self._md5sum_for_file(filename)
         given = self.md5s[filename]
-        if found == given:
-            logger.debug("checksum for {0} correct".format(filename))
-        else:
-            logger.debug("checksum for {0} wrong".format(filename))
         return given == found
 
     def _md5sum_for_file(self, filename):
@@ -201,7 +197,7 @@ class DumpDownloader(object):
                               filename))
                 self.hdfs_client.delete(file_path, recursive=True)
             if (self.statuses[filename] == FILE_CORRUPT):
-                logger.debug("Deleting {0} because it is is corrupt".format(
+                logger.debug("Deleting {0} because it is corrupt".format(
                               filename))
                 self.hdfs_client.delete(file_path, recursive=True)
                 self.statuses[filename] = FILE_ABSENT
