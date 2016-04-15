@@ -91,6 +91,7 @@ class DumpDownloader(object):
         self._identify_target_file_list_and_md5s()
         self._check_status_of_existing_files()
         self._prepare_hdfs()
+        self._download_dumps()
 
     def _verifty_dump_ready_for_download(self):
         url = DUMP_STATUS_URI_PATTERN.format(wikidb, day)
@@ -133,10 +134,13 @@ class DumpDownloader(object):
         for filename in self.filenames:
             fullpath = os.path.join(output_path, filename)
             if f_name not in present_files:
+                logging.debug("{0} is absent".format(filename))
                 self.statuses[filename] = FILE_ABSENT
             elif self._confirm_checksum(filename):
+                logging.debug("{0} is present".format(filename))
                 self.statuses[filename] = FILE_PRESENT
             else:
+                logging.debug("{0} is corrupt".format(filename))
                 self.statuses[filename] = FILE_CORRUPT
 
     def _confirm_checksum(self, filename):
@@ -181,8 +185,12 @@ class DumpDownloader(object):
         for filename in present_files:
             file_path = os.path.join(hdfs_path, filename)
             if (filename not in self.filenames):
+                logging.debug("Deleting {0} because it doesn't belong".format(
+                              filename))
                 hdfs_client.delete(file_path, recursive=True)
             if (self.statuses[filename] == FILE_CORRUPT):
+                logging.debug("Deleting {0} because it is is corrupt".format(
+                              filename))
                 hdfs_client.delete(file_path, recursive=True)
                 self.statuses[filename] = FILE_ABSENT
 
