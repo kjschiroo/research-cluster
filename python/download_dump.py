@@ -62,6 +62,167 @@ FILE_ABSENT = 1
 FILE_CORRUPT = 2
 
 
+class DumpDownloader(object):
+
+    def __init__(self,
+                 wikidb,
+                 day,
+                 name_node,
+                 base_path,
+                 user,
+                 num_threads,
+                 buffer_size,
+                 timeout,
+                 force):
+        self.wikidb = wikidb
+        self.day = day
+        self.name_node = name_node
+        self.base_path = base_path
+        self.user = user
+        self.num_threads = num_threads
+        self.buffer_size = buffer_size
+        self.timeout = timeout
+        self.force = force
+
+    def run(self):
+        self._verifty_dump_ready_for_download()
+        self._configure_hdfs_client()
+        self._configure_output_path()
+        self._identify_target_file_list_and_md5s()
+        self._check_status_of_existing_files()
+        self._prepare_hdfs()
+
+    def _verifty_dump_ready_for_download(self):
+        url = DUMP_STATUS_URI_PATTERN.format(wikidb, day)
+        logger.debug("Checking for dump completion at {0}".format(url))
+        req = requests.get(url)
+        if not ((req.status_code == 200) and ('Dump complete' in req.text)):
+            raise RuntimeError("Dump not ready to be downloaded from MediaWiki")
+
+    def _configure_hdfs_client(self):
+        name_node = self.name_node
+        user = self.user
+        self.hdfs_client = hdfs.client.InsecureClient(name_node, user=user)
+
+    def _configure_output_path(self):
+        self.output_path = os.path.join(base_path,
+                                        '{0}-{1}'.format(self.wikidb, self.day),
+                                        'xmlbz2')
+
+    def _identify_target_file_list_and_md5s(self):
+        url = DUMP_MD5_URI_PATTERN.format(self.wikidb, self.day),
+        bz2_pattern = DUMP_BZ2_FILE_PATTERN.format(self.wikidb, self.day)
+        logger.debug("Getting files list to download {0}".format(url))
+        req = requests.get(url)
+        self.filenames = []
+        self.md5s = {}
+        if (req.status_code == 200):
+            p = re.compile(bz2_pattern)
+            for line in req.text.split('\n'):
+                match = p.search(line)
+                if match:
+                    md5, filename = line.split()
+                    self.filenames.append(filename)
+                    self.md5s[filename] = md5
+        else:
+            raise RuntimeError("MD5 hash listing unavailable")
+
+    def _check_status_of_existing_files(self):
+        self.statuses = {}
+        present_files = self.hdfs_client.list(self.output_path)
+        for filename in self.filenames:
+            fullpath = os.path.join(output_path, filename)
+            if f_name not in present_files:
+                self.statuses[filename] = FILE_ABSENT
+            elif self._confirm_checksum(filename):
+                self.statuses[filename] = FILE_PRESENT
+            else:
+                self.statuses[filename] = FILE_CORRUPT
+
+    def _confirm_checksum(self, filename):
+        found = self._md5sum_for_file(filename)
+        given = self.md5s[filename]
+        return given == found
+
+    def _md5sum_for_file(self, filename):
+        md5 = hashlib.md5()
+        filepath = os.path.join(self.output_path, filename)
+        with self.hdfs_client.read(filepath, chunk_size=4096) as reader:
+            for chunk in reader:
+                md5.update(chunk)
+        return md5.hexdigest()
+
+    def _prepare_hdfs(self, hdfs_path, files_info, force):
+        if self.hdfs_client.content(self.output_path, strict=False):
+            if self.force:
+                try:
+                    self.hdfs_client.delete(self.output_path, recursive=True)
+                    self.hdfs_client.makedirs(self.output_path)
+                    [self.statuses[f] = FILE_ABSENT for f in self.statuses]
+                except hdfs.HdfsError as e:
+                    logger.error(e)
+                    raise RuntimeError("Problem preparing for download [force].")
+            else:
+                logger.debug("Checking existing files in folder before download")
+                try:
+                    self._remove_corrupt_and_unexpected_files()
+                except hdfs.HdfsError as e:
+                    logger.error(e)
+                    raise RuntimeError("Problem preparing for download [merge].")
+        else:
+            try:
+                self.hdfs_client.makedirs(self.output_path)
+            except hdfs.HdfsError as e:
+                logger.error(e)
+                raise RuntimeError("Problem preparing for download [new].")
+
+    def _remove_corrupt_and_unexpected_files(self):
+        present_files = self.hdfs_client.list(self.output_path)
+        for filename in present_files:
+            file_path = os.path.join(hdfs_path, filename)
+            if (filename not in self.filenames):
+                hdfs_client.delete(file_path, recursive=True)
+            if (self.statuses[filename] == FILE_CORRUPT):
+                hdfs_client.delete(file_path, recursive=True)
+                self.statuses[filename] = FILE_ABSENT
+
+    def _download_dumps():
+        logger.debug("Instantiating {0} workers ".format(self.num_threads) +
+                     "to download {0} files.".format(len(self.filenames)))
+
+        q = Queue.Queue()
+        errs = []
+
+        files_to_download = [f for f in self.statuses
+                             if self.statuses[f] != FILE_PRESENT]
+        for filename in files_to_download:
+            file_url = DOWNLOAD_FILE_PATTERN.format(self.wikidb,
+                                                    self.day,
+                                                    filename)
+            hdfs_file_path = os.path.join(self.output_path, filename)
+            q.put((file_url, hdfs_file_path, ))
+
+        threads = [threading.Thread(target=worker,
+                                    args=[q,
+                                          errs,
+                                          self.name_node,
+                                          self.user,
+                                          self.num_retries,
+                                          self.buffer_size,
+                                          self.timeout])
+                   for _i in range(self.num_threads)]
+
+        for thread in threads:
+            thread.start()
+            q.put((None, None))  # one EOF marker for each thread
+
+        q.join()
+
+        if errs:
+            raise RuntimeError("Failed to download some file(s):\n\t{0}".format(
+                '\n\t'.join(errs)))
+
+
 def main():
     args = docopt.docopt(__doc__)
 
@@ -82,155 +243,19 @@ def main():
     timeout = int(args['--timeout'])
     force = args['--force']
 
-    run(wikidb, day, name_node, base_path, user, num_threads, num_retries,
-        buffer_size, timeout, force)
-
-
-def run(wikidb, day, name_node, base_path, user, num_threads, num_retries,
-        buffer_size, timeout, force):
-
-    # Force insecure client usage for correct hdfs user setup
-    hdfs_client = hdfs.client.InsecureClient(name_node, user=user)
-    output_path = os.path.join(base_path, '{0}-{1}'.format(wikidb, day),
-                               'xmlbz2')
-
-    ################# TESTING ####################
-    checksums = get_dump_file_md5(DUMP_MD5_URI_PATTERN.format(wikidb, day))
-    filenames = dump_filenames(DUMP_SHA1_URI_PATTERN.format(wikidb, day),
-                               DUMP_BZ2_FILE_PATTERN.format(wikidb, day))
-    statuses = file_status(hdfs_client, output_path, filenames, checksums)
-    for k in statuses:
-        print('{0} - {1}'.format(k, statuses[k]))
-    return
-    ################# DONE TESTING ###############
-
-    if not prepare_hdfs(hdfs_client, output_path, force):
-        raise RuntimeError("Problem preparing hdfs")
-
-    if not dump_completed(DUMP_STATUS_URI_PATTERN.format(wikidb, day)):
-        raise RuntimeError("Dump not ready to be downloaded from MediaWiki")
-
-    download_dumps(wikidb, day, name_node, output_path, user, num_threads,
-                   num_retries, buffer_size, timeout)
-
-
-def download_dumps(wikidb, day, name_node, output_path, user, num_threads,
-                   num_retries, buffer_size, timeout):
-    filenames = dump_filenames(DUMP_SHA1_URI_PATTERN.format(wikidb, day),
-                               DUMP_BZ2_FILE_PATTERN.format(wikidb, day))
-
-    logger.debug("Instantiating {0} workers ".format(num_threads) +
-                 "to download {0} files.".format(len(filenames)))
-
-    q = Queue.Queue()
-    errs = []
-
-    for filename in filenames:
-        file_url = DOWNLOAD_FILE_PATTERN.format(wikidb, day, filename)
-        hdfs_file_path = os.path.join(output_path, filename)
-        q.put((file_url, hdfs_file_path, ))
-
-    threads = [threading.Thread(target=worker,
-                                args=[q, errs, name_node, user, num_retries,
-                                      buffer_size, timeout])
-               for _i in range(num_threads)]
-
-    for thread in threads:
-        thread.start()
-        q.put((None, None))  # one EOF marker for each thread
-
-    q.join()
-
-    if errs:
-        raise RuntimeError("Failed to download some file(s):\n\t{0}".format(
-            '\n\t'.join(errs)))
-
-
-def get_dump_file_md5(url):
-    req = requests.get(url)
-    md5s = {}
-    text = req.text.strip()
-    for line in text.split('\n'):
-        md5, filename = line.split()
-        md5s[filename] = md5
-    return md5s
-
-
-def file_status(hdfs_client, output_path, file_names, file_checksums):
-    statuses = {}
-    present_files = hdfs_client.list(output_path)
-    for f_name in file_names:
-        fullpath = os.path.join(output_path, f_name)
-        if f_name not in present_files:
-            statuses[f_name] = FILE_ABSENT
-        elif confirm_checksum(hdfs_client, fullpath, file_checksums[f_name]):
-            statuses[f_name] = FILE_PRESENT
-        else:
-            statuses[f_name] = FILE_CORRUPT
-    return statuses
-
-
-def confirm_checksum(hdfs_client, file_path, known_checksum):
-    print(file_path)
-    found = md5sum_for_file(hdfs_client, file_path)
-    print('Found {0}'.format(found))
-    print('Known {0}'.format(known_checksum))
-    return known_checksum == found
-
-
-def md5sum_for_file(hdfs_client, file_path):
-    md5 = hashlib.md5()
-    with hdfs_client.read(file_path, chunk_size=4096) as reader:
-        for chunk in reader:
-            md5.update(chunk)
-    return md5.hexdigest()
-
-
-def prepare_hdfs(hdfs_client, output_path, force):
-    logger.debug("Preparing hdfs for path {0}".format(output_path))
-    bz2_files_pattern = os.path.join(output_path, "*.bz2")
-
-    if hdfs_client.content(output_path, strict=False):
-        # Output path already exists
-        if force:
-            try:
-                logger.debug("Deleting and recreating directory {0}".format(
-                    output_path))
-                hdfs_client.delete(output_path, recursive=True)
-                hdfs_client.makedirs(output_path)
-                return True
-            except hdfs.HdfsError as e:
-                logger.error(e)
-                return False
-        else:
-            return False
-    else:
-        try:
-            logger.debug("Creating directory {0}".format(output_path))
-            hdfs_client.makedirs(output_path)
-            return True
-        except hdfs.HdfsError as e:
-            logger.error(e)
-            return False
-
-
-def dump_completed(url):
-    logger.debug("Checking for dump completion at {0}".format(url))
-    req = requests.get(url)
-    return ((req.status_code == 200) and ('Dump complete' in req.text))
-
-
-def dump_filenames(url, bz2_pattern):
-    logger.debug("Getting files list to download {0}".format(url))
-    req = requests.get(url)
-    filenames = []
-    if (req.status_code == 200):
-        p = re.compile(bz2_pattern)
-        for line in req.text.split('\n'):
-            match = p.search(line)
-            if match:
-                filenames.append(match.group(0))
-    return filenames
+    dl = DumpDownloader(
+        wikidb,
+        day,
+        name_node,
+        base_path,
+        user,
+        num_threads,
+        num_retries,
+        buffer_size,
+        timeout,
+        force
+    )
+    dl.run()
 
 
 def worker(q, errs, name_node, user, num_retries, buffer_size, timeout):
