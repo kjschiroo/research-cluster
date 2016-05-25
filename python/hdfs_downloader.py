@@ -3,7 +3,7 @@ Reusable parallel download-to-HDFS script
 """
 import logging
 import os.path
-import random
+import time
 
 import hdfs
 import requests
@@ -140,7 +140,7 @@ class HDFSDownloader(object):
 
     def _download_to_hdfs(self, hdfs_client, url, path):
         session = requests.Session()
-        usr_agnt = 'altiscale_{0}'.format(random.randint(0, 10000))
+        usr_agnt = 'altiscale_{0}'.format(repr(time.time()))
         session.mount("http://", requests.adapters.HTTPAdapter(max_retries=3))
         req = session.get(url,
                           stream=True,
